@@ -8,11 +8,37 @@ def psi(*,
         # TODO: parameter to include / exclude missing values
         numeric_columns: list[str] = None,
         categorical_columns: list[str] = None) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """
-    Return: pl.DataFrame containing PSI values. With shape (n_columns, 1).
+    """Calculate the population stability index statistic. If the PSI is undefined, then the value defaults to null.
+
+    PSI is considered undefined if any of the following conditions are true:
+        1. Categorical column in the base data contains levels not found in the comparison data. E.g., col1_base: ['a', 'b', 'c'], col1_compare: ['a', 'b']
+
+    Args:
+        df_base (polars.DataFrame): The base dataframe.
+        df_compare (polars.DataFrame): The comparison dataframe.
+        bins (int, optional): The number of bins to use. Defaults to 10.
+        numeric_columns (list[str], optional): The numeric columns to use. Defaults to None.
+        categorical_columns (list[str], optional): The categorical columns to use. Defaults to None.
+
+    Returns:
+        tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+        A tuple containing the PSI values, a frequency table for the base data, and a frequency table for the comparison data.
     """
 
-    # Argument checks
+    # Input validation
+
+    # Type checks
+    if not (isinstance(df_base, pl.DataFrame) and isinstance(df_compare, pl.DataFrame)):
+        raise TypeError("df_base and df_compare must be of type polars.DataFrame")
+    if not (bins > 0 and isinstance(bins, int)):
+        raise TypeError("bins must be positive integers")
+    if not (isinstance(numeric_columns, list) or isinstance(categorical_columns, list)):
+        raise TypeError("numeric_columns and categorical_columns must be a list of strings")
+
+    if numeric_columns is None: numeric_columns = []
+    if categorical_columns is None: categorical_columns = []
+
+    # Check that all columns exist in both df_base and df_compare
     if missing_cols := set(numeric_columns + categorical_columns) - set(df_base.columns):
         raise Exception(f'Column(s) not found in df_base: {missing_cols}')
     if missing_cols := set(numeric_columns + categorical_columns) - set(df_compare.columns):
@@ -22,32 +48,38 @@ def psi(*,
     if overlap := set(numeric_columns) & set(categorical_columns):
         raise Exception(f'numeric_columns and categorical_columns have overlapping columns: {overlap}')
 
-    # Column is included in numeric_columns, but is categorical
-    # Column is included in categorical_columns, but is numeric
+    # Check that all numeric_columns are numeric
+    if not all([df_base[col].dtype.is_numeric() for col in numeric_columns] + [df_compare[col].dtype.is_numeric() for col in numeric_columns]):
+        raise Exception('Non numeric columns found in numeric_columns')
+
+    # TODO: type checking for categorical columns
+
+
 
     # Data checks
     # inf values?
 
     # Initialize frequency tables and Lazy dataframes
-    df_base_num_freq = pl.DataFrame()
-    df_compare_num_freq = pl.DataFrame()
+    df_base_num_count = pl.DataFrame()
+    df_compare_num_count = pl.DataFrame()
     df_base_cat_freq = pl.DataFrame()
     df_compare_cat_freq = pl.DataFrame()
     ldf_base = df_base.lazy()
     ldf_compare = df_compare.lazy()
-
-    # todo: combine the code for base / compare?
 
     # Get PSI for numeric columns
     if numeric_columns:
         # Get bins from base using quantiles
         quantiles = pl.linear_space(0, 1, bins + 1, eager=True).to_list()
         dict_cols_cutoffs = (
-            pl.concat([df_base.select(pl.col(numeric_columns)).quantile(quantile, interpolation='linear') for quantile in quantiles], how='vertical')
+            pl.concat(
+                [ldf_base.select(pl.col(numeric_columns)).quantile(quantile, interpolation='linear') for quantile in quantiles], how='vertical'
+            )
+            .collect()
             .to_dict(as_series=False)
         )
 
-        # Preprocess bin edges,
+        # Preprocess bin edges
         for col, list_edges in dict_cols_cutoffs.items():
             dict_cols_cutoffs[col][0] = float('-inf')
             dict_cols_cutoffs[col][-1] = float('inf')
@@ -61,61 +93,54 @@ def psi(*,
         # TODO: is this a general solution?
         dict_cols_cutoffs = {col: list(dict.fromkeys(edges)) for col, edges in dict_cols_cutoffs.items()}
 
-        # Get frequencies of base and compare df
-        ldf_base_freq = pl.concat(
-            [ldf_base.select(pl.col(col).hist(bins=cutoffs, include_category=True)) for col, cutoffs in dict_cols_cutoffs.items()],
+        # Get bin counts for each df
+        # TODO: .hist() can fail if all values are NaN or identical — needs explicit handling?
+        list_ldfs_counts = [
+            pl.concat(
+            [ldf.select(pl.col(col).hist(bins=cutoffs, include_category=True)) for col, cutoffs in dict_cols_cutoffs.items()],
             how='horizontal'
         )
+            for ldf in [ldf_base, ldf_compare]
+        ]
 
-        ldf_compare_freq = pl.concat(
-            [ldf_compare.select(pl.col(col).hist(bins=cutoffs, include_category=True)) for col, cutoffs in dict_cols_cutoffs.items()],
-            how='horizontal'
-        )
+        df_base_num_count, df_compare_num_count = pl.collect_all(list_ldfs_counts)
 
-        df_base_num_freq, df_compare_num_freq = pl.collect_all([ldf_base_freq, ldf_compare_freq])
-
-        # Get null frequencies
-        # TODO: make lazy, combine with categorical? would allow more flexibility
-        df_base_null_freq = df_base.select(
-            [pl.struct(category=pl.lit('missing', dtype=pl.Categorical), count=pl.col(col).null_count()).alias(col) for col in numeric_columns]
-        )
-
-        df_compare_null_freq = df_base.select(
-            [pl.struct(category=pl.lit('missing', dtype=pl.Categorical), count=pl.col(col).null_count()).alias(col) for col in numeric_columns]
-        )
+        # Get null counts
+        list_dfs_null_counts = [
+            df.select(
+                [pl.struct(category=pl.lit('missing', dtype=pl.Categorical), count=pl.col(col).null_count()).alias(col)
+                 for col in numeric_columns]
+            )
+            for df in [df_base, df_compare]
+        ]
 
         # Append null freq, Null count can be 0, which results in log(0)
-        df_base_num_freq = pl.concat([df_base_num_freq, df_base_null_freq], how='vertical')
-        df_compare_num_freq = pl.concat([df_compare_num_freq, df_compare_null_freq], how='vertical')
+        # TODO: refactor to avoid indexing list
+        df_base_num_count = pl.concat([df_base_num_count, list_dfs_null_counts[0]], how='vertical_relaxed')
+        df_compare_num_count = pl.concat([df_compare_num_count, list_dfs_null_counts[1]], how='vertical_relaxed')
 
     # Get PSI for categorical columns
     if categorical_columns:
-        # Nulls are included in value_counts
-        ldf_base_cat_freq = pl.concat(
-            [
-                ldf_base.select(pl.col(col).value_counts(parallel=True).struct.rename_fields(['category', 'count']))
-                .select(pl.col(col).struct.with_fields(pl.field('category').cast(pl.String).cast(pl.Categorical)))
-                .sort(pl.col(col).struct.field('category'), nulls_last=True)
-                for col in categorical_columns
-            ],
-            how='horizontal'
-        )
 
-        ldf_compare_cat_freq = pl.concat(
-            [
-                ldf_compare.select(pl.col(col).value_counts(parallel=True).struct.rename_fields(['category', 'count']))
-                .select(pl.col(col).struct.with_fields(pl.field('category').cast(pl.String).cast(pl.Categorical)))
-                .sort(pl.col(col).struct.field('category'), nulls_last=True)
-                for col in categorical_columns
-            ],
-            how='horizontal'
-        )
+        # Get counts for categorical levels. Nulls are a category in value_counts
+        list_ldfs_cat_counts = [
+            pl.concat(
+                [
+                    ldf.select(pl.col(col).value_counts(parallel=True).struct.rename_fields(['category', 'count']))
+                    .select(pl.col(col).struct.with_fields(pl.field('category').cast(pl.String).cast(pl.Categorical)))
+                    .sort(pl.col(col).struct.field('category'), nulls_last=True)
+                    for col in categorical_columns
+                ],
+                how='horizontal'
+            )
+            for ldf in [ldf_base, ldf_compare]
+        ]
 
-        df_base_cat_freq, df_compare_cat_freq = pl.collect_all([ldf_base_cat_freq, ldf_compare_cat_freq])
+        df_base_cat_freq, df_compare_cat_freq = pl.collect_all(list_ldfs_cat_counts)
 
     # Combine numerical, categorical frequencies
-    df_base_freq_struct = pl.concat([df_base_num_freq, df_base_cat_freq], how='horizontal')
-    df_compare_freq_struct = pl.concat([df_compare_num_freq, df_compare_cat_freq], how='horizontal')
+    df_base_freq_struct = pl.concat([df_base_num_count, df_base_cat_freq], how='horizontal')
+    df_compare_freq_struct = pl.concat([df_compare_num_count, df_compare_cat_freq], how='horizontal')
 
     # TODO: validate data of df_base_feq and df_compare_freq
     # DQ check: all percents sum to 1
