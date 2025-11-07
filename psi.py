@@ -5,7 +5,6 @@ def psi(*,
         df_base: pl.DataFrame,
         df_compare: pl.DataFrame,
         bins: int = 10,
-        # TODO: parameter to include / exclude missing values
         numeric_columns: list[str] = None,
         categorical_columns: list[str] = None) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """Calculate the population stability index statistic. If the PSI is undefined, then the value defaults to null.
@@ -25,7 +24,10 @@ def psi(*,
         A tuple containing the PSI values, a frequency table for the base data, and a frequency table for the comparison data.
     """
 
+    # TODO: parameter to include / exclude missing values
     # Input validation
+    if numeric_columns is None: numeric_columns = []
+    if categorical_columns is None: categorical_columns = []
 
     # Type checks
     if not (isinstance(df_base, pl.DataFrame) and isinstance(df_compare, pl.DataFrame)):
@@ -34,9 +36,8 @@ def psi(*,
         raise TypeError("bins must be positive integers")
     if not (isinstance(numeric_columns, list) or isinstance(categorical_columns, list)):
         raise TypeError("numeric_columns and categorical_columns must be a list of strings")
-
-    if numeric_columns is None: numeric_columns = []
-    if categorical_columns is None: categorical_columns = []
+    if not (numeric_columns != [] or categorical_columns != []):
+        raise ValueError("Must pass at least one column to numeric_columns or categorical_columns")
 
     # Check that all columns exist in both df_base and df_compare
     if missing_cols := set(numeric_columns + categorical_columns) - set(df_base.columns):
@@ -54,10 +55,7 @@ def psi(*,
 
     # TODO: type checking for categorical columns
 
-
-
     # Data checks
-    # inf values?
 
     # Initialize frequency tables and Lazy dataframes
     df_base_num_count = pl.DataFrame()
@@ -71,33 +69,48 @@ def psi(*,
     if numeric_columns:
         # Get bins from base using quantiles
         quantiles = pl.linear_space(0, 1, bins + 1, eager=True).to_list()
-        dict_cols_cutoffs = (
+        dict_cols_edges = (
             pl.concat(
-                [ldf_base.select(pl.col(numeric_columns)).quantile(quantile, interpolation='linear') for quantile in quantiles], how='vertical'
+                [ldf_base.select(pl.col(numeric_columns)).quantile(q, interpolation='linear') for q in quantiles], how='vertical'
             )
             .collect()
-            .to_dict(as_series=False)
+            .to_dict(as_series=True)
         )
 
-        # Preprocess bin edges
-        for col, list_edges in dict_cols_cutoffs.items():
-            dict_cols_cutoffs[col][0] = float('-inf')
-            dict_cols_cutoffs[col][-1] = float('inf')
+        # Preprocess bins
+        for col, edges in dict_cols_edges.items():
 
             # Edge case: if first edge is an integer, .hist casts the result column as u64, resulting in a TypeError if the other edges are floats
             # Explicitly cast all values to float
             # TODO: issue casting int to float? e.g., 1.000000001
-            dict_cols_cutoffs[col] = [float(val) for val in list_edges]
 
-        # Edge case: Check that bin edges are not strictly monotonic. E.g., [0, 0, 0, 1.5, 2.1, 4.]
-        # TODO: is this a general solution?
-        dict_cols_cutoffs = {col: list(dict.fromkeys(edges)) for col, edges in dict_cols_cutoffs.items()}
+            # What properties of the bins does .hist require?
+                # edges must be strictly monotonic
+                # edges must be numeric
+                # edges cannot be null
+                    # when will edges be null? E.g., when col is all null
+                    # Is it possible for there to be a single null? Or if there's a null, will the entire series be null?
+                # How many edges?
+                # hist can handle empty sequences
+
+            # .hist requires numeric type
+            dict_cols_edges[col] = dict_cols_edges[col].cast(pl.Float64)
+
+            # Slightly redundant since first and last edge is defined earlier
+            dict_cols_edges[col][0] = float('-inf')
+            dict_cols_edges[col][-1] = float('inf')
+
+            # Ensure strict monotonicity. E.g., [0, 0, 0, 1.5, 2.1, 4.]
+            dict_cols_edges[col] = dict_cols_edges[col].unique(maintain_order=True)
+
+            # Remove nulls if they exist
+            dict_cols_edges[col] = dict_cols_edges[col].drop_nulls()
 
         # Get bin counts for each df
-        # TODO: .hist() can fail if all values are NaN or identical — needs explicit handling?
+        # TODO: .hist() can fail if all values are NaN or identical, None — needs explicit handling?
         list_ldfs_counts = [
             pl.concat(
-            [ldf.select(pl.col(col).hist(bins=cutoffs, include_category=True)) for col, cutoffs in dict_cols_cutoffs.items()],
+            [ldf.select(pl.col(col).hist(bins=edges, include_category=True)) for col, edges in dict_cols_edges.items()],
             how='horizontal'
         )
             for ldf in [ldf_base, ldf_compare]
@@ -115,7 +128,7 @@ def psi(*,
         ]
 
         # Append null freq, Null count can be 0, which results in log(0)
-        # TODO: refactor to avoid indexing list
+        # TODO: refactor to avoid indexing list?
         df_base_num_count = pl.concat([df_base_num_count, list_dfs_null_counts[0]], how='vertical_relaxed')
         df_compare_num_count = pl.concat([df_compare_num_count, list_dfs_null_counts[1]], how='vertical_relaxed')
 
@@ -143,9 +156,7 @@ def psi(*,
     df_compare_freq_struct = pl.concat([df_compare_num_count, df_compare_cat_freq], how='horizontal')
 
     # TODO: validate data of df_base_feq and df_compare_freq
-    # DQ check: all percents sum to 1
-    # assert df_base_prop.sum().select(((pl.all() - pl.lit(1)).abs() <= 1e-6)).transpose()['column_0'].all()
-    # assert df_compare_prop.sum().select(((pl.all() - pl.lit(1)).abs() <= 1e-6)).transpose()['column_0'].all()
+    # TODO: interpret category not in compare as the category count being 0?
 
     # Check if categories are equal for each column
     df_base_fields = df_base_freq_struct.select(pl.all().struct.field('category').name.keep())
@@ -167,6 +178,10 @@ def psi(*,
     df_base_prop = df_base_freq / df_base.height
     df_compare_prop = df_compare_freq / df_compare.height
 
+    # DQ check: all percents sum to 1
+    # assert df_base_prop.sum().select(((pl.all() - pl.lit(1)).abs() <= 1e-6)).transpose()['column_0'].all()
+    # assert df_compare_prop.sum().select(((pl.all() - pl.lit(1)).abs() <= 1e-6)).transpose()['column_0'].all()
+
     # Apply PSI formula (possible inf if freq is 0)
     df_psi = (df_base_prop - df_compare_prop) * (df_base_prop.select(pl.all().log()) - df_compare_prop.select(pl.all().log()))
     df_psi = df_psi.sum().transpose(include_header=True, header_name='attribute', column_names=['psi'])
@@ -179,15 +194,4 @@ def psi(*,
         .name.keep()
     )
 
-    # edge cases: bins with 0 volume
-
     return df_psi, df_base_freq_struct, df_compare_freq_struct
-
-def debug_fn():
-
-    df_base = pl.read_csv('./tests/base_data.csv')
-    df_compare = pl.read_csv('./tests/compare_data.csv')
-
-    psi_value = psi(df_base=df_base, df_compare=df_compare, numeric_columns=['col1_norm'])[0]
-
-#debug_fn()

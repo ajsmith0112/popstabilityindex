@@ -5,9 +5,10 @@ The popstabilityindex provides functionality to calculate the Population Stabili
 Designed to be highly performant by relying solely on polars.
 
 Supported functionality:
-* Numerical columns
-* Categorical columns
-* Missing values
+* Numerical columns.
+* Categorical columns.
+* Missing values are created as a bin.
+* inf values are binned with the last bin and -inf values are binned with the first bin.
 
 # Usage
 
