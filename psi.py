@@ -5,8 +5,10 @@ def psi(*,
         df_base: pl.DataFrame,
         df_compare: pl.DataFrame,
         bins: int = 10,
+        include_nulls: bool = True,
         numeric_columns: list[str] = None,
-        categorical_columns: list[str] = None) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+        categorical_columns: list[str] = None
+        ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """Calculate the population stability index statistic. If the PSI is undefined, then the value defaults to null.
 
     PSI is considered undefined if any of the following conditions are true:
@@ -16,15 +18,16 @@ def psi(*,
         df_base (polars.DataFrame): The base dataframe.
         df_compare (polars.DataFrame): The comparison dataframe.
         bins (int, optional): The number of bins to use. Defaults to 10.
+        include_nulls (bool, optional): Whether to include null values as a bin in the PSI calculation. Defaults to True.
         numeric_columns (list[str], optional): The numeric columns to use. Defaults to None.
-        categorical_columns (list[str], optional): The categorical columns to use. Defaults to None.
+        categorical_columns (list[str], optional): The categorical columns to use. Columns must be of type pl.String, pl.Categorical, pl.Enum, or an integer type. Defaults to None.
 
     Returns:
         tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
         A tuple containing the PSI values, a frequency table for the base data, and a frequency table for the comparison data.
     """
 
-    # TODO: parameter to include / exclude missing values
+    # TODO: parameter to include / exclude missing values?
     # Input validation
     if numeric_columns is None: numeric_columns = []
     if categorical_columns is None: categorical_columns = []
@@ -50,6 +53,7 @@ def psi(*,
         raise Exception(f'numeric_columns and categorical_columns have overlapping columns: {overlap}')
 
     # Check that all numeric_columns are numeric
+    # TODO: print which columns are not numeric
     if not all([df_base[col].dtype.is_numeric() for col in numeric_columns] + [df_compare[col].dtype.is_numeric() for col in numeric_columns]):
         raise Exception('Non numeric columns found in numeric_columns')
 
@@ -57,17 +61,17 @@ def psi(*,
 
     # Data checks
 
-    # Initialize frequency tables and Lazy dataframes
+    # Initialize count tables and Lazy dataframes
     df_base_num_count = pl.DataFrame()
     df_compare_num_count = pl.DataFrame()
-    df_base_cat_freq = pl.DataFrame()
-    df_compare_cat_freq = pl.DataFrame()
+    df_base_cat_count = pl.DataFrame()
+    df_compare_cat_count = pl.DataFrame()
     ldf_base = df_base.lazy()
     ldf_compare = df_compare.lazy()
 
     # Get PSI for numeric columns
     if numeric_columns:
-        # Get bins from base using quantiles
+        # Get bins from base using quantiles. Returning as a Series ensures a consistent datatype of the elements in the Sequence.
         quantiles = pl.linear_space(0, 1, bins + 1, eager=True).to_list()
         dict_cols_edges = (
             pl.concat(
@@ -118,19 +122,20 @@ def psi(*,
 
         df_base_num_count, df_compare_num_count = pl.collect_all(list_ldfs_counts)
 
-        # Get null counts
-        list_dfs_null_counts = [
-            df.select(
-                [pl.struct(category=pl.lit('missing', dtype=pl.Categorical), count=pl.col(col).null_count()).alias(col)
-                 for col in numeric_columns]
-            )
-            for df in [df_base, df_compare]
-        ]
+        # Append null count, Null count can be 0, which results in log(0)
+        if include_nulls:
+            # Get null counts
+            list_dfs_null_counts = [
+                df.select(
+                    [pl.struct(category=pl.lit('missing', dtype=pl.Categorical), count=pl.col(col).null_count()).alias(
+                        col)
+                     for col in numeric_columns]
+                )
+                for df in [df_base, df_compare]
+            ]
 
-        # Append null freq, Null count can be 0, which results in log(0)
-        # TODO: refactor to avoid indexing list?
-        df_base_num_count = pl.concat([df_base_num_count, list_dfs_null_counts[0]], how='vertical_relaxed')
-        df_compare_num_count = pl.concat([df_compare_num_count, list_dfs_null_counts[1]], how='vertical_relaxed')
+            df_base_num_count = pl.concat([df_base_num_count, list_dfs_null_counts[0]], how='vertical_relaxed')
+            df_compare_num_count = pl.concat([df_compare_num_count, list_dfs_null_counts[1]], how='vertical_relaxed')
 
     # Get PSI for categorical columns
     if categorical_columns:
@@ -149,40 +154,40 @@ def psi(*,
             for ldf in [ldf_base, ldf_compare]
         ]
 
-        df_base_cat_freq, df_compare_cat_freq = pl.collect_all(list_ldfs_cat_counts)
+        df_base_cat_count, df_compare_cat_count = pl.collect_all(list_ldfs_cat_counts)
 
-    # Combine numerical, categorical frequencies
-    df_base_freq_struct = pl.concat([df_base_num_count, df_base_cat_freq], how='horizontal')
-    df_compare_freq_struct = pl.concat([df_compare_num_count, df_compare_cat_freq], how='horizontal')
+    # Combine numerical, categorical counts
+    df_base_count_struct = pl.concat([df_base_num_count, df_base_cat_count], how='horizontal')
+    df_compare_count_struct = pl.concat([df_compare_num_count, df_compare_cat_count], how='horizontal')
 
-    # TODO: validate data of df_base_feq and df_compare_freq
+    # TODO: validate data of df_base_feq and df_compare_count
     # TODO: interpret category not in compare as the category count being 0?
 
     # Check if categories are equal for each column
-    df_base_fields = df_base_freq_struct.select(pl.all().struct.field('category').name.keep())
-    df_compare_fields = df_compare_freq_struct.select(pl.all().struct.field('category').name.keep())
+    df_base_fields = df_base_count_struct.select(pl.all().struct.field('category').name.keep())
+    df_compare_fields = df_compare_count_struct.select(pl.all().struct.field('category').name.keep())
     list_invalid_psi = []
     for col in df_base_fields.columns:
         if not df_base_fields[col].equals(df_compare_fields[col]):
             list_invalid_psi.append(col)
 
     # Unnest structs to get counts
-    df_base_freq = df_base_freq_struct.with_columns(pl.col(pl.Struct).struct.field('count').name.keep())
-    df_compare_freq = df_compare_freq_struct.with_columns(pl.col(pl.Struct).struct.field('count').name.keep())
+    df_base_count = df_base_count_struct.with_columns(pl.col(pl.Struct).struct.field('count').name.keep())
+    df_compare_count = df_compare_count_struct.with_columns(pl.col(pl.Struct).struct.field('count').name.keep())
 
-    # TODO: Temp fix: set 0 frequencies to null
-    df_base_freq = df_base_freq.select(pl.when(pl.all() == 0).then(pl.lit(None)).otherwise(pl.all()).name.keep())
-    df_compare_freq = df_compare_freq.select(pl.when(pl.all() == 0).then(pl.lit(None)).otherwise(pl.all()).name.keep())
+    # TODO: Temp fix: set 0 count to null
+    df_base_count = df_base_count.select(pl.when(pl.all() == 0).then(pl.lit(None)).otherwise(pl.all()).name.keep())
+    df_compare_count = df_compare_count.select(pl.when(pl.all() == 0).then(pl.lit(None)).otherwise(pl.all()).name.keep())
 
-    # Normalize frequencies
-    df_base_prop = df_base_freq / df_base.height
-    df_compare_prop = df_compare_freq / df_compare.height
+    # Normalize counts to proportions
+    df_base_prop = df_base_count / df_base.height
+    df_compare_prop = df_compare_count / df_compare.height
 
     # DQ check: all percents sum to 1
     # assert df_base_prop.sum().select(((pl.all() - pl.lit(1)).abs() <= 1e-6)).transpose()['column_0'].all()
     # assert df_compare_prop.sum().select(((pl.all() - pl.lit(1)).abs() <= 1e-6)).transpose()['column_0'].all()
 
-    # Apply PSI formula (possible inf if freq is 0)
+    # Apply PSI formula (possible inf if count is 0)
     df_psi = (df_base_prop - df_compare_prop) * (df_base_prop.select(pl.all().log()) - df_compare_prop.select(pl.all().log()))
     df_psi = df_psi.sum().transpose(include_header=True, header_name='attribute', column_names=['psi'])
 
@@ -194,4 +199,4 @@ def psi(*,
         .name.keep()
     )
 
-    return df_psi, df_base_freq_struct, df_compare_freq_struct
+    return df_psi, df_base_count_struct, df_compare_count_struct
